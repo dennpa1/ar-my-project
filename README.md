@@ -1,1 +1,0 @@
-# ar-my-project
