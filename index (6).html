@@ -1,0 +1,438 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>ESP32 AR Hand Controller</title>
+
+<script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+<script src="https://raw.githack.com/AR-js-org/AR.js/3.4.8/aframe/build/aframe-ar.js"></script>
+
+<style>
+body {
+  margin: 0;
+  font-family: sans-serif;
+}
+
+#panel {
+  position: fixed;
+  top: 5px;
+  left: 5px;
+  z-index: 1000;
+  width: 280px;
+  max-height: 42vh;
+  overflow: auto;
+  background: rgba(255,255,255,.95);
+  padding: 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+
+button {
+  padding: 10px;
+  background: #1976d2;
+  color: white;
+  border: none;
+  border-radius: 5px;
+  margin: 3px;
+}
+
+button:disabled {
+  background: gray;
+}
+
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+</style>
+</head>
+
+<body>
+
+<div id="panel">
+
+<h3>AR Hand Controller</h3>
+
+<button id="connect">ESP32接続</button>
+<button id="disconnect" disabled>切断</button>
+
+<p id="status">モデル読み込み中</p>
+<p id="boneCount">ボーン確認中</p>
+<p id="receiveCount">受信数：0</p>
+
+<details>
+<summary>ボーン一覧</summary>
+<pre id="boneList"></pre>
+</details>
+
+</div>
+
+<a-scene
+  embedded
+  vr-mode-ui="enabled:false"
+  renderer="logarithmicDepthBuffer:true"
+  arjs="sourceType:webcam;debugUIEnabled:false;">
+
+  <a-marker preset="hiro">
+
+    <a-entity
+      id="hand"
+      gltf-model="url(./models/human-hand.glb)"
+      position="0 0 0.2"
+      rotation="0 0 0"
+      scale="0.5 0.5 0.5">
+    </a-entity>
+
+  </a-marker>
+
+  <a-entity camera></a-entity>
+
+</a-scene>
+
+<script>
+
+// =================================
+// 1. ボーン設定
+// =================================
+
+// 空欄の場合は自動検出候補を利用
+// 実際のGLBのボーン名に合わせて設定する
+
+const BONE_MAP = {
+  thumb1: "",
+  thumb2: "",
+  thumb3: "",
+
+  index1: "",
+  index2: "",
+  index3: "",
+
+  middle1: "",
+  middle2: "",
+  middle3: "",
+
+  ring1: "",
+  ring2: "",
+  ring3: "",
+
+  pinky1: "",
+  pinky2: "",
+  pinky3: ""
+};
+
+// 回転軸
+const AXIS = {
+  x: 0,
+  y: 0,
+  z: 1
+};
+
+// 回転方向
+const DIRECTION = {};
+
+// =================================
+// 2. 内部変数
+// =================================
+
+const bones = {};
+const baseRotations = {};
+
+let modelReady = false;
+let port = null;
+let reader = null;
+let readTask = null;
+let receiveCount = 0;
+let connecting = false;
+
+// =================================
+// 3. 画面表示
+// =================================
+
+const status = document.getElementById("status");
+
+function showStatus(message) {
+  status.textContent = message;
+}
+
+// =================================
+// 4. モデル読み込み
+// =================================
+
+const hand = document.getElementById("hand");
+
+hand.addEventListener("model-loaded", () => {
+
+  const model = hand.getObject3D("mesh");
+
+  if (!model) {
+    showStatus("モデル取得失敗");
+    return;
+  }
+
+  const allBones = [];
+
+  model.traverse(object => {
+    if (object.isBone) {
+      allBones.push(object);
+    }
+  });
+
+  document.getElementById("boneCount").textContent =
+    "ボーン数：" + allBones.length;
+
+  document.getElementById("boneList").textContent =
+    allBones.map(b => b.name).join("\n");
+
+  // ボーン登録
+  for (const key in BONE_MAP) {
+
+    const name = BONE_MAP[key];
+
+    if (!name) continue;
+
+    const bone = allBones.find(
+      b => b.name === name
+    );
+
+    if (!bone) {
+      console.warn("ボーン未発見:", key, name);
+      continue;
+    }
+
+    bones[key] = bone;
+    baseRotations[key] = bone.quaternion.clone();
+  }
+
+  modelReady = true;
+
+  showStatus("3Dモデル読み込み成功");
+
+  console.log("検出ボーン:", allBones);
+  console.log("登録ボーン:", bones);
+
+});
+
+hand.addEventListener("model-error", error => {
+  console.error(error);
+  showStatus("GLB読み込み失敗");
+});
+
+// =================================
+// 5. 指の角度制御
+// =================================
+
+function updateHand(data) {
+
+  if (!modelReady) return;
+
+  for (const key in BONE_MAP) {
+
+    const bone = bones[key];
+
+    if (!bone) continue;
+
+    if (!Number.isFinite(data[key])) continue;
+
+    const degree = Math.max(
+      0,
+      Math.min(90, data[key])
+    );
+
+    const sign = DIRECTION[key] ?? 1;
+
+    const radian =
+      degree * Math.PI / 180 * sign;
+
+    const rotation = new THREE.Quaternion();
+
+    rotation.setFromAxisAngle(
+      new THREE.Vector3(
+        AXIS.x,
+        AXIS.y,
+        AXIS.z
+      ),
+      radian
+    );
+
+    bone.quaternion.copy(
+      baseRotations[key]
+    ).multiply(rotation);
+
+  }
+
+}
+
+// =================================
+// 6. ESP32接続
+// =================================
+
+async function connectESP32() {
+
+  if (connecting || port) return;
+
+  connecting = true;
+
+  try {
+
+    if (!("serial" in navigator)) {
+      showStatus("Web Serial API非対応");
+      return;
+    }
+
+    port = await navigator.serial.requestPort();
+
+    await port.open({
+      baudRate: 115200
+    });
+
+    document.getElementById("connect").disabled = true;
+    document.getElementById("disconnect").disabled = false;
+
+    showStatus("ESP32接続成功・受信中");
+
+    const decoder = new TextDecoderStream();
+
+    const pipeClosed = port.readable.pipeTo(
+      decoder.writable
+    );
+
+    reader = decoder.readable.getReader();
+
+    readTask = readSerial(pipeClosed);
+
+    await readTask;
+
+  } catch (error) {
+
+    console.error(error);
+
+    showStatus("通信エラー：" + error.message);
+
+  } finally {
+
+    connecting = false;
+
+  }
+
+}
+
+// =================================
+// 7. シリアル受信
+// =================================
+
+async function readSerial(pipeClosed) {
+
+  let buffer = "";
+
+  try {
+
+    while (reader) {
+
+      const result = await reader.read();
+
+      if (result.done) break;
+
+      buffer += result.value;
+
+      // 改行区切り
+      const lines = buffer.split("\n");
+
+      buffer = lines.pop();
+
+      for (const line of lines) {
+
+        if (!line.trim()) continue;
+
+        try {
+
+          const data = JSON.parse(line);
+
+          updateHand(data);
+
+          receiveCount++;
+
+          document.getElementById("receiveCount").textContent =
+            "受信数：" + receiveCount;
+
+        } catch (error) {
+
+          console.warn("JSON解析エラー:", line, error);
+
+        }
+
+      }
+
+    }
+
+  } finally {
+
+    if (reader) {
+      reader.releaseLock();
+      reader = null;
+    }
+
+    try {
+      await pipeClosed;
+    } catch (error) {
+      console.warn("通信終了:", error);
+    }
+
+    if (port) {
+      try {
+        await port.close();
+      } catch (error) {
+        console.warn(error);
+      }
+    }
+
+    port = null;
+
+    document.getElementById("connect").disabled = false;
+    document.getElementById("disconnect").disabled = true;
+
+    showStatus("ESP32切断");
+
+  }
+
+}
+
+// =================================
+// 8. 切断
+// =================================
+
+async function disconnectESP32() {
+
+  if (!reader) return;
+
+  showStatus("切断処理中");
+
+  try {
+
+    await reader.cancel();
+
+  } catch (error) {
+
+    console.warn(error);
+
+  }
+
+}
+
+// =================================
+// 9. ボタンイベント
+// =================================
+
+document.getElementById("connect")
+  .addEventListener("click", connectESP32);
+
+document.getElementById("disconnect")
+  .addEventListener("click", disconnectESP32);
+
+</script>
+
+</body>
+</html>
